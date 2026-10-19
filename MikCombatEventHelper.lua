@@ -163,6 +163,450 @@ local elapsedTime = 0;
 
 
 -------------------------------------------------------------------------------------
+-- [OctoWoW] Native combat events (nampower).
+--
+-- With nampower loaded, damage/heal/miss/power/aura events come straight from the
+-- client as structured events (GUIDs, spell IDs, amounts) instead of being parsed
+-- out of ~30 combat-log chat channels with localized text patterns. That parsing
+-- ran for every combat line in the raid and was MSBT's main cost.
+-- Low-volume chat events (honor, reputation, skill, XP, killing blows, item buffs,
+-- buff fades) still use the original parsers. Chat events that are replaced here
+-- are only kept registered when a search-pattern trigger or event search needs them.
+-- Set MikCEH_DisableNative = true (before login) to restore the old behaviour.
+-------------------------------------------------------------------------------------
+local nativeMode = false;
+local eventsRegistered = false;
+local legacyRegistered = {};
+
+-- Chat events fully covered by native events.
+local nativeReplacedEvents = {
+ ["CHAT_MSG_COMBAT_CREATURE_VS_SELF_HITS"] = true,
+ ["CHAT_MSG_COMBAT_HOSTILEPLAYER_HITS"] = true,
+ ["CHAT_MSG_COMBAT_PARTY_HITS"] = true,
+ ["CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES"] = true,
+ ["CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES"] = true,
+ ["CHAT_MSG_COMBAT_PARTY_MISSES"] = true,
+ ["CHAT_MSG_SPELL_CREATURE_VS_SELF_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_CREATURE_VS_CREATURE_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_PARTY_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_DAMAGESHIELDS_ON_OTHERS"] = true,
+ ["CHAT_MSG_SPELL_HOSTILEPLAYER_BUFF"] = true,
+ ["CHAT_MSG_SPELL_CREATURE_VS_SELF_BUFF"] = true,
+ ["CHAT_MSG_SPELL_PERIODIC_SELF_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS"] = true,
+ ["CHAT_MSG_COMBAT_SELF_HITS"] = true,
+ ["CHAT_MSG_COMBAT_SELF_MISSES"] = true,
+ ["CHAT_MSG_SPELL_SELF_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_DAMAGESHIELDS_ON_SELF"] = true,
+ ["CHAT_MSG_SPELL_SELF_BUFF"] = true,
+ ["CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_BUFFS"] = true,
+ ["CHAT_MSG_SPELL_PERIODIC_PARTY_BUFFS"] = true,
+ ["CHAT_MSG_SPELL_PERIODIC_CREATURE_BUFFS"] = true,
+ ["CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE"] = true,
+ ["CHAT_MSG_COMBAT_PET_HITS"] = true,
+ ["CHAT_MSG_COMBAT_PET_MISSES"] = true,
+ ["CHAT_MSG_SPELL_PET_DAMAGE"] = true,
+};
+
+-- Mana/rage drains done to you have no native event: keep these two channels for
+-- the power-loss parser only (they only carry lines that affect you).
+local powerLossEvents = {
+ ["CHAT_MSG_SPELL_CREATURE_VS_SELF_DAMAGE"] = true,
+ ["CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE"] = true,
+};
+
+local nativeEventList = {
+ "AUTO_ATTACK_SELF", "AUTO_ATTACK_OTHER",
+ "SPELL_DAMAGE_EVENT_SELF", "SPELL_DAMAGE_EVENT_OTHER",
+ "SPELL_MISS_SELF", "SPELL_MISS_OTHER",
+ "SPELL_HEAL_BY_SELF", "SPELL_HEAL_ON_SELF", "SPELL_HEAL_BY_OTHER",
+ "SPELL_ENERGIZE_ON_SELF",
+ "ENVIRONMENTAL_DMG_SELF",
+ "DAMAGE_SHIELD_SELF", "DAMAGE_SHIELD_OTHER",
+ "BUFF_ADDED_SELF", "DEBUFF_ADDED_SELF",
+ "UNIT_PET", "PLAYER_ENTERING_WORLD",
+};
+
+local nativeHandlers = {};
+local playerGuid, petGuid;
+local auraSuppressUntil = 0;
+local spellNameCache = {};
+
+local band = bit and bit.band;
+
+-- nampower school -> MikCEH damage type
+local schoolMap = { [0] = 1, [1] = 2, [2] = 4, [3] = 3, [4] = 5, [5] = 6, [6] = 7 };
+
+local function GetGUIDOf(unit)
+ if (GetUnitGUID) then return GetUnitGUID(unit); end
+ if (UnitGUID) then return UnitGUID(unit); end
+end
+
+local function RefreshGuids()
+ playerGuid = GetGUIDOf("player");
+ if (UnitExists("pet")) then petGuid = GetGUIDOf("pet"); else petGuid = nil; end
+end
+
+local function NameFromGuid(guid)
+ if (not guid) then return nil; end
+ return UnitName(guid);
+end
+
+local function SpellNameFromId(spellId)
+ if (not spellId or spellId == 0) then return nil; end
+ local name = spellNameCache[spellId];
+ if (name == nil) then
+  if (GetSpellInfo) then name = GetSpellInfo(spellId); end
+  if (not name and SpellInfo) then name = SpellInfo(spellId); end
+  spellNameCache[spellId] = name or false;
+ end
+ return name or nil;
+end
+
+-- Returns direction type and the name to show (the other party), or nil if the
+-- event does not involve the player or the player's pet.
+local function ResolveDirection(sourceGuid, targetGuid)
+ if (targetGuid == playerGuid) then
+  if (sourceGuid == playerGuid) then
+   return MikCEH.DIRECTIONTYPE_PLAYER_INCOMING, playerName;
+  end
+  return MikCEH.DIRECTIONTYPE_PLAYER_INCOMING, NameFromGuid(sourceGuid);
+ elseif (sourceGuid == playerGuid) then
+  return MikCEH.DIRECTIONTYPE_PLAYER_OUTGOING, NameFromGuid(targetGuid);
+ elseif (petGuid) then
+  if (sourceGuid == petGuid) then
+   return MikCEH.DIRECTIONTYPE_PET_OUTGOING, NameFromGuid(targetGuid);
+  elseif (targetGuid == petGuid) then
+   return MikCEH.DIRECTIONTYPE_PET_INCOMING, NameFromGuid(sourceGuid);
+  end
+ end
+end
+
+local function ParseMitigation(mitigationStr)
+ local _, _, absorb, block, resist = string.find(mitigationStr or "", "^(%-?%d+),(%-?%d+),(%-?%d+)");
+ return tonumber(absorb) or 0, tonumber(block) or 0, tonumber(resist) or 0;
+end
+
+local function SetPartial(eventData, absorb, block, resist)
+ if (absorb > 0) then
+  eventData.PartialActionType = MikCEH.PARTIALACTIONTYPE_ABSORB;
+  eventData.PartialAmount = absorb;
+ elseif (block > 0) then
+  eventData.PartialActionType = MikCEH.PARTIALACTIONTYPE_BLOCK;
+  eventData.PartialAmount = block;
+ elseif (resist > 0) then
+  eventData.PartialActionType = MikCEH.PARTIALACTIONTYPE_RESIST;
+  eventData.PartialAmount = resist;
+ end
+end
+
+local function PopulateNativeOverheal(eventData, targetGuid)
+ if (not targetGuid) then return; end
+ local maxHealth = UnitHealthMax(targetGuid);
+ if (not maxHealth or maxHealth == 0 or maxHealth == 100) then return; end
+ local overheal = eventData.Amount - (maxHealth - (UnitHealth(targetGuid) or 0));
+ if (overheal > 0) then
+  eventData.PartialActionType = MikCEH.PARTIALACTIONTYPE_OVERHEAL;
+  eventData.PartialAmount = overheal;
+ end
+end
+
+-- MSBT only has display settings for the event types its chat parser could
+-- produce (for example there is no OUTGOING_PET_SPELL_REFLECT). Native events can
+-- report combinations the chat log never showed, so remap those to the closest
+-- event type that exists, or drop them, instead of printing "No profile data".
+local actionSuffix = {
+ [1] = "DAMAGE", [2] = "MISS", [3] = "DODGE", [4] = "PARRY", [5] = "BLOCK",
+ [6] = "RESIST", [7] = "ABSORB", [8] = "IMMUNE", [9] = "EVADE", [10] = "REFLECT",
+};
+-- fallback action when the profile has no entry for an action
+local actionFallback = {
+ [10] = 6, -- reflect -> resist
+ [9] = 2,  -- evade -> miss
+ [6] = 2,  -- resist -> miss
+ [7] = 2,  -- absorb -> miss
+ [5] = 2,  -- block -> miss
+ [3] = 2,  -- dodge -> miss
+ [4] = 2,  -- parry -> miss
+ [8] = 2,  -- immune -> miss
+};
+local directionPrefix = {
+ [1] = "MSBT_EVENTTYPE_INCOMING_",
+ [2] = "MSBT_EVENTTYPE_OUTGOING_",
+ [3] = "MSBT_EVENTTYPE_OUTGOING_PET_",
+ [4] = "MSBT_EVENTTYPE_INCOMING_PET_",
+};
+local function EventTypeExists(eventData)
+ local prefix = directionPrefix[eventData.DirectionType];
+ if (not prefix) then return true; end
+ local settings = MikSBT.CurrentProfile and MikSBT.CurrentProfile.EventSettings;
+ if (not settings) then return true; end
+ local key;
+ if (eventData.EventType == MikCEH.EVENTTYPE_HEAL) then
+  key = prefix .. ((eventData.HealType == MikCEH.HEALTYPE_OVER_TIME) and "HOT" or "HEAL");
+ elseif (eventData.EventType == MikCEH.EVENTTYPE_DAMAGE) then
+  local action = eventData.ActionType;
+  if (action and action > 10) then return true; end -- environmental
+  local suffix;
+  if (action == MikCEH.ACTIONTYPE_HIT) then
+   suffix = (eventData.HitType == MikCEH.HITTYPE_OVER_TIME) and "DOT" or "DAMAGE";
+  else
+   suffix = actionSuffix[action];
+  end
+  if (not suffix) then return false; end
+  key = prefix .. (eventData.EffectName and "SPELL_" or "") .. suffix;
+ else
+  return true;
+ end
+ return settings[key] ~= nil;
+end
+
+local function SendNativeEvent(eventData)
+ local tries = 0;
+ while (not EventTypeExists(eventData)) do
+  tries = tries + 1;
+  if (tries > 4) then return; end
+  if (eventData.EventType == MikCEH.EVENTTYPE_DAMAGE) then
+   if (eventData.ActionType == MikCEH.ACTIONTYPE_HIT and eventData.HitType == MikCEH.HITTYPE_OVER_TIME) then
+    -- e.g. a pet DoT: show it as normal spell damage
+    eventData.HitType = MikCEH.HITTYPE_NORMAL;
+   elseif (actionFallback[eventData.ActionType]) then
+    eventData.ActionType = actionFallback[eventData.ActionType];
+   elseif (eventData.EffectName) then
+    -- try the melee (non-spell) variant
+    eventData.EffectName = nil;
+   else
+    return;
+   end
+  elseif (eventData.EventType == MikCEH.EVENTTYPE_HEAL and eventData.HealType == MikCEH.HEALTYPE_OVER_TIME) then
+   eventData.HealType = MikCEH.HEALTYPE_NORMAL;
+  else
+   return;
+  end
+ end
+ MikCEH.SendEvent(eventData);
+end
+
+-- Spell damage (direct and periodic).
+local function OnSpellDamage(targetGuid, casterGuid, spellId, amount, mitigationStr, hitInfo, spellSchool, effectAuraStr)
+ local direction, name = ResolveDirection(casterGuid, targetGuid);
+ if (not direction) then return; end
+
+ local _, _, auraType = string.find(effectAuraStr or "", "(%d+)$");
+ auraType = tonumber(auraType) or 0;
+ local absorb, block, resist = ParseMitigation(mitigationStr);
+ local effectName = SpellNameFromId(spellId);
+ local eventData;
+
+ if (not amount or amount <= 0) then
+  local actionType;
+  if (absorb > 0) then actionType = MikCEH.ACTIONTYPE_ABSORB;
+  elseif (resist > 0) then actionType = MikCEH.ACTIONTYPE_RESIST;
+  elseif (block > 0) then actionType = MikCEH.ACTIONTYPE_BLOCK;
+  else return; end
+  eventData = MikCEH.GetDamageEventData(direction, actionType, nil, nil, nil, effectName, name);
+ else
+  local hitType = MikCEH.HITTYPE_NORMAL;
+  if (auraType ~= 0) then
+   hitType = MikCEH.HITTYPE_OVER_TIME;
+  elseif (band and hitInfo and band(hitInfo, 2) ~= 0) then
+   hitType = MikCEH.HITTYPE_CRIT;
+  end
+  eventData = MikCEH.GetDamageEventData(direction, MikCEH.ACTIONTYPE_HIT, hitType, schoolMap[spellSchool] or MikCEH.DAMAGETYPE_UNKNOWN, amount, effectName, name);
+  SetPartial(eventData, absorb, block, resist);
+ end
+ SendNativeEvent(eventData);
+end
+nativeHandlers["SPELL_DAMAGE_EVENT_SELF"] = OnSpellDamage;
+nativeHandlers["SPELL_DAMAGE_EVENT_OTHER"] = OnSpellDamage;
+
+-- Melee / ranged auto attacks.
+local victimStateActions = {
+ [2] = MikCEH.ACTIONTYPE_DODGE,
+ [3] = MikCEH.ACTIONTYPE_PARRY,
+ [6] = MikCEH.ACTIONTYPE_EVADE,
+ [7] = MikCEH.ACTIONTYPE_IMMUNE,
+ [8] = MikCEH.ACTIONTYPE_MISS,
+};
+local function OnAutoAttack(attackerGuid, targetGuid, totalDamage, hitInfo, victimState, subDamageCount, blockedAmount, totalAbsorb, totalResist)
+ local direction, name = ResolveDirection(attackerGuid, targetGuid);
+ if (not direction) then return; end
+ hitInfo = hitInfo or 0;
+ totalDamage = totalDamage or 0;
+ blockedAmount = blockedAmount or 0;
+ totalAbsorb = totalAbsorb or 0;
+ totalResist = totalResist or 0;
+
+ local actionType;
+ if (band and band(hitInfo, 16) ~= 0) then
+  actionType = MikCEH.ACTIONTYPE_MISS;
+ elseif (victimStateActions[victimState]) then
+  actionType = victimStateActions[victimState];
+ elseif (totalDamage <= 0) then
+  if (victimState == 5 or blockedAmount > 0) then actionType = MikCEH.ACTIONTYPE_BLOCK;
+  elseif (totalAbsorb > 0) then actionType = MikCEH.ACTIONTYPE_ABSORB;
+  elseif (totalResist > 0) then actionType = MikCEH.ACTIONTYPE_RESIST;
+  else return; end
+ end
+
+ local eventData;
+ if (actionType) then
+  eventData = MikCEH.GetDamageEventData(direction, actionType, nil, nil, nil, nil, name);
+ else
+  local hitType = MikCEH.HITTYPE_NORMAL;
+  if (band and band(hitInfo, 128) ~= 0) then hitType = MikCEH.HITTYPE_CRIT; end
+  eventData = MikCEH.GetDamageEventData(direction, MikCEH.ACTIONTYPE_HIT, hitType, MikCEH.DAMAGETYPE_PHYSICAL, totalDamage, nil, name);
+  SetPartial(eventData, totalAbsorb, blockedAmount, totalResist);
+  if (not eventData.PartialActionType and band) then
+   if (band(hitInfo, 32768) ~= 0) then
+    eventData.PartialActionType = MikCEH.PARTIALACTIONTYPE_CRUSHING;
+   elseif (band(hitInfo, 16384) ~= 0) then
+    eventData.PartialActionType = MikCEH.PARTIALACTIONTYPE_GLANCING;
+   end
+  end
+ end
+ SendNativeEvent(eventData);
+end
+nativeHandlers["AUTO_ATTACK_SELF"] = OnAutoAttack;
+nativeHandlers["AUTO_ATTACK_OTHER"] = OnAutoAttack;
+
+-- Spell misses, resists, immunes, reflects...
+local missActions = {
+ [1] = MikCEH.ACTIONTYPE_MISS,
+ [2] = MikCEH.ACTIONTYPE_RESIST,
+ [3] = MikCEH.ACTIONTYPE_DODGE,
+ [4] = MikCEH.ACTIONTYPE_PARRY,
+ [5] = MikCEH.ACTIONTYPE_BLOCK,
+ [6] = MikCEH.ACTIONTYPE_EVADE,
+ [7] = MikCEH.ACTIONTYPE_IMMUNE,
+ [8] = MikCEH.ACTIONTYPE_IMMUNE,
+ [9] = MikCEH.ACTIONTYPE_MISS,
+ [10] = MikCEH.ACTIONTYPE_ABSORB,
+ [11] = MikCEH.ACTIONTYPE_REFLECT,
+};
+local function OnSpellMiss(casterGuid, targetGuid, spellId, missInfo)
+ local actionType = missActions[missInfo];
+ if (not actionType) then return; end
+ local direction, name = ResolveDirection(casterGuid, targetGuid);
+ if (not direction) then return; end
+ local eventData = MikCEH.GetDamageEventData(direction, actionType, nil, nil, nil, SpellNameFromId(spellId), name);
+ SendNativeEvent(eventData);
+end
+nativeHandlers["SPELL_MISS_SELF"] = OnSpellMiss;
+nativeHandlers["SPELL_MISS_OTHER"] = OnSpellMiss;
+
+-- Heals.
+local function SendHeal(direction, targetGuid, spellId, amount, critical, periodic, name)
+ if (not amount or amount <= 0) then return; end
+ local healType = MikCEH.HEALTYPE_NORMAL;
+ if (periodic == 1) then healType = MikCEH.HEALTYPE_OVER_TIME;
+ elseif (critical == 1) then healType = MikCEH.HEALTYPE_CRIT; end
+ local eventData = MikCEH.GetHealEventData(direction, healType, amount, SpellNameFromId(spellId), name);
+ PopulateNativeOverheal(eventData, targetGuid);
+ SendNativeEvent(eventData);
+end
+nativeHandlers["SPELL_HEAL_BY_SELF"] = function(targetGuid, casterGuid, spellId, amount, critical, periodic)
+ if (targetGuid == playerGuid) then
+  SendHeal(MikCEH.DIRECTIONTYPE_PLAYER_INCOMING, targetGuid, spellId, amount, critical, periodic, playerName);
+ else
+  SendHeal(MikCEH.DIRECTIONTYPE_PLAYER_OUTGOING, targetGuid, spellId, amount, critical, periodic, NameFromGuid(targetGuid));
+ end
+end
+nativeHandlers["SPELL_HEAL_ON_SELF"] = function(targetGuid, casterGuid, spellId, amount, critical, periodic)
+ -- Self heals are already shown by SPELL_HEAL_BY_SELF.
+ if (casterGuid == playerGuid) then return; end
+ SendHeal(MikCEH.DIRECTIONTYPE_PLAYER_INCOMING, targetGuid, spellId, amount, critical, periodic, NameFromGuid(casterGuid));
+end
+nativeHandlers["SPELL_HEAL_BY_OTHER"] = function(targetGuid, casterGuid, spellId, amount, critical, periodic)
+ -- Only heals landing on your pet (fires for every heal in the raid, so bail fast).
+ if (not petGuid or targetGuid ~= petGuid) then return; end
+ SendHeal(MikCEH.DIRECTIONTYPE_PET_INCOMING, targetGuid, spellId, amount, critical, periodic, NameFromGuid(casterGuid));
+end
+
+-- Power gains.
+local powerNames = { [0] = MANA, [1] = RAGE, [2] = FOCUS, [3] = ENERGY };
+nativeHandlers["SPELL_ENERGIZE_ON_SELF"] = function(targetGuid, casterGuid, spellId, powerType, amount, periodic)
+ local powerName = powerNames[powerType];
+ if (not powerName or not amount or amount <= 0) then return; end
+ local eventData = MikCEH.GetNotificationEventData(MikCEH.NOTIFICATIONTYPE_POWER_GAIN, amount, powerName, SpellNameFromId(spellId));
+ SendNativeEvent(eventData);
+end
+
+-- Environmental damage.
+local environmentalActions = {
+ [0] = MikCEH.ACTIONTYPE_FATIGUE,
+ [1] = MikCEH.ACTIONTYPE_DROWNING,
+ [2] = MikCEH.ACTIONTYPE_FALLING,
+ [3] = MikCEH.ACTIONTYPE_LAVA,
+ [4] = MikCEH.ACTIONTYPE_SLIME,
+ [5] = MikCEH.ACTIONTYPE_FIRE,
+ [6] = MikCEH.ACTIONTYPE_FALLING,
+};
+nativeHandlers["ENVIRONMENTAL_DMG_SELF"] = function(unitGuid, dmgType, damage, absorb, resist)
+ local actionType = environmentalActions[dmgType];
+ if (not actionType or not damage or damage <= 0) then return; end
+ local eventData = MikCEH.GetDamageEventData(MikCEH.DIRECTIONTYPE_PLAYER_INCOMING, actionType, nil, MikCEH.DAMAGETYPE_PHYSICAL, damage, nil, nil);
+ SendNativeEvent(eventData);
+end
+
+-- Damage shields (Thorns, Retribution Aura...).
+nativeHandlers["DAMAGE_SHIELD_SELF"] = function(unitGuid, targetGuid, damage, spellSchool)
+ if (not damage or damage <= 0) then return; end
+ local eventData = MikCEH.GetDamageEventData(MikCEH.DIRECTIONTYPE_PLAYER_OUTGOING, MikCEH.ACTIONTYPE_HIT, MikCEH.HITTYPE_NORMAL, schoolMap[spellSchool] or MikCEH.DAMAGETYPE_UNKNOWN, damage, nil, NameFromGuid(targetGuid));
+ SendNativeEvent(eventData);
+end
+nativeHandlers["DAMAGE_SHIELD_OTHER"] = function(unitGuid, targetGuid, damage, spellSchool)
+ if (targetGuid ~= playerGuid or not damage or damage <= 0) then return; end
+ local eventData = MikCEH.GetDamageEventData(MikCEH.DIRECTIONTYPE_PLAYER_INCOMING, MikCEH.ACTIONTYPE_HIT, MikCEH.HITTYPE_NORMAL, schoolMap[spellSchool] or MikCEH.DAMAGETYPE_UNKNOWN, damage, nil, NameFromGuid(unitGuid));
+ SendNativeEvent(eventData);
+end
+
+-- Buffs and debuffs gained (state 0 = newly added).
+nativeHandlers["BUFF_ADDED_SELF"] = function(guid, luaSlot, spellId, stacks, auraLevel, auraSlot, state)
+ if (state ~= 0 or GetTime() < auraSuppressUntil) then return; end
+ local name = SpellNameFromId(spellId);
+ if (not name) then return; end
+ SendNativeEvent(MikCEH.GetNotificationEventData(MikCEH.NOTIFICATIONTYPE_BUFF, nil, name));
+end
+nativeHandlers["DEBUFF_ADDED_SELF"] = function(guid, luaSlot, spellId, stacks, auraLevel, auraSlot, state)
+ if (state ~= 0 or GetTime() < auraSuppressUntil) then return; end
+ local name = SpellNameFromId(spellId);
+ if (not name) then return; end
+ SendNativeEvent(MikCEH.GetNotificationEventData(MikCEH.NOTIFICATIONTYPE_DEBUFF, nil, name));
+end
+
+-- GUID bookkeeping.
+nativeHandlers["UNIT_PET"] = function(unit)
+ if (unit == "player") then RefreshGuids(); end
+end
+nativeHandlers["PLAYER_ENTERING_WORLD"] = function()
+ RefreshGuids();
+ -- The client re-sends every aura you already have after a loading screen.
+ auraSuppressUntil = GetTime() + 3;
+end
+
+
+-- **********************************************************************************
+-- Registers/unregisters the replaced chat events depending on what still needs them.
+-- **********************************************************************************
+function MikCEH.UpdateLegacyRegistrations()
+ if (not eventsRegistered) then return; end
+ for eventName in pairs(nativeReplacedEvents) do
+  local needed = (not nativeMode) or searchMode or powerLossEvents[eventName] or (searchPatternTriggers[eventName] ~= nil);
+  if (needed and not legacyRegistered[eventName]) then
+   MCEHEventFrame:RegisterEvent(eventName);
+   legacyRegistered[eventName] = true;
+  elseif (not needed and legacyRegistered[eventName]) then
+   MCEHEventFrame:UnregisterEvent(eventName);
+   legacyRegistered[eventName] = nil;
+  end
+ end
+end
+
+
+-------------------------------------------------------------------------------------
 -- Core event handlers.
 -------------------------------------------------------------------------------------
 
@@ -170,10 +614,31 @@ local elapsedTime = 0;
 -- Registers all of the events the helper is interested in.
 -- **********************************************************************************
 function MikCEH.RegisterEvents()
+ -- [OctoWoW] Use nampower's structured combat events when available.
+ nativeMode = (not MikCEH_DisableNative) and (GetNampowerVersion ~= nil or GetUnitGUID ~= nil) and (band ~= nil);
+ if (nativeMode) then
+  -- Some nampower builds only fire these when their CVar is on.
+  for _, cvar in ipairs({"NP_EnableAutoAttackEvents", "NP_EnableSpellHealEvents", "NP_EnableSpellEnergizeEvents"}) do
+   local ok, value = pcall(GetCVar, cvar);
+   if (ok and value == "0") then pcall(SetCVar, cvar, "1"); end
+  end
+  RefreshGuids();
+ end
+
  -- Register the events we are interested in receiving.
  for k, v in listenEvents do
-  MCEHEventFrame:RegisterEvent(v);
- end 
+  if (not nativeReplacedEvents[v]) then
+   MCEHEventFrame:RegisterEvent(v);
+  end
+ end
+ if (nativeMode) then
+  for _, v in ipairs(nativeEventList) do
+   MCEHEventFrame:RegisterEvent(v);
+  end
+ end
+
+ eventsRegistered = true;
+ MikCEH.UpdateLegacyRegistrations();
 end
 
 
@@ -185,6 +650,13 @@ function MikCEH.UnregisterEvents()
  for k, v in listenEvents do
   MCEHEventFrame:UnregisterEvent(v);
  end 
+ for _, v in ipairs(nativeEventList) do
+  MCEHEventFrame:UnregisterEvent(v);
+ end
+ for k in pairs(legacyRegistered) do
+  legacyRegistered[k] = nil;
+ end
+ eventsRegistered = false;
 end
 
 
@@ -249,6 +721,13 @@ end
 -- Called when the events the helper registered for occur.
 -- **********************************************************************************
 function MikCEH.OnEvent()
+ -- [OctoWoW] Native (nampower) events.
+ local nativeHandler = nativeHandlers[event];
+ if (nativeHandler) then
+  nativeHandler(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9);
+  return;
+ end
+
  -- When an addon is loaded.
  if (event == "ADDON_LOADED") then
   -- Make sure it's the right addon.
@@ -326,7 +805,14 @@ function MikCEH.OnEvent()
  -- Chat message combat events.
  else
   MikCEH.ParseSearchPatternTriggers(event, arg1);
-  MikCEH.ParseCombatEvents(event, arg1);
+  if (nativeMode and nativeReplacedEvents[event]) then
+   -- Handled by native events; only mana/rage drains on you still need the text.
+   if (powerLossEvents[event]) then
+    MikCEH.ParseForPowerLosses(arg1);
+   end
+  else
+   MikCEH.ParseCombatEvents(event, arg1);
+  end
 
  end
 end
@@ -3721,6 +4207,7 @@ function MikCEH.EnableEventSearching(pattern)
  -- to the passed pattern.
  searchMode = true;
  searchModePattern = pattern;
+ MikCEH.UpdateLegacyRegistrations();
 end
 
 
@@ -3731,6 +4218,7 @@ function MikCEH.DisableEventSearching()
  -- Clear the event searching mode flag and search pattern.
  searchMode = false;
  searchModePattern = nil;
+ MikCEH.UpdateLegacyRegistrations();
 end
 
 
@@ -3838,6 +4326,7 @@ function MikCEH.RegisterTrigger(triggerKey, triggerSettings)
   end
 
  end   -- Is trigger for class?
+ MikCEH.UpdateLegacyRegistrations();
 end
 
 
@@ -3852,6 +4341,7 @@ function MikCEH.UnregisterAllTriggers()
  MikCEH.EraseTable(enemyHealthTriggers);
  MikCEH.EraseTable(friendlyHealthTriggers);
  MikCEH.EraseTable(searchPatternTriggers);
+ MikCEH.UpdateLegacyRegistrations();
 end
 
 
